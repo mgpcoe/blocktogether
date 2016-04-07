@@ -2,10 +2,18 @@
   <script defer type='text/javascript' src='/static/show-blocks.js'></script>
   <script defer type='text/javascript' src='/static/multi-select.js'></script>
   {{^own_blocks}}
-    User <a href='https://mobile.twitter.com/{{author_screen_name}}' class='screen-name'
+    User <a href='https://twitter.com/{{author_screen_name}}' class='screen-name'
       >@{{author_screen_name}}</a>
-    is blocking {{item_count}} users on Twitter (updated {{updated}}). Showing
-    {{per_page}} per page:
+    is blocking {{item_count}} users on Twitter (updated {{updated}}).
+    {{#paginate}}
+    Showing {{per_page}} per page.
+    {{/paginate}}
+    <div class="search">
+      <form action="" method="GET">
+        <input id="screen_name" name="screen_name" type="text"></input>
+        <button type="submit" class="btn btn-primary">Search by screen name</button>
+      </form>
+    </div>
   </p>
   {{/own_blocks}}
   {{#own_blocks}}
@@ -38,20 +46,28 @@
     </div>
   {{/own_blocks}}
 
-  {{! When displaying someone else's blocks, give an option to block all the
-      same ones on this page.  }}
+  {{! When displaying someone else's blocks, give an option to block and
+      subscribe. }}
   {{^own_blocks}}
+  {{#subscribed}}
+  You are subscribed to this block list and will auto-block new accounts that
+  are added to it. To unsubscribe, visit <a href='/subscriptions'>the
+  Subscriptions page</a>.
+  {{/subscribed}}
+  {{^subscribed}}
+  <p>
+  If you subscribe to @{{author_screen_name}}'s block list, they will be able
+  to see that you are a subscriber and will have the option to unsubscribe you.
+  They will not receive a notification.
+  </p>
   <div>
-    <button class='btn btn-primary block-all'>Block All {{item_count}}</button>
-    <div class='block-all-processing'>
-      Block Together will now block
-      <span id='blocked-users'></span>
-      users using your account @{{logged_in_screen_name}}.
-      This may take some time. You can check on progress at
-      <a href='/actions'>the Actions page</a>.
-    </div>
+    <button class='btn btn-primary block-all'>Block All and Subscribe</button>
+    {{>block-all-processing.mustache}}
   </div>
+  {{/subscribed}}
   {{/own_blocks}}
+  {{! For use in case there's an error. }}
+  <div id="error-message"></div>
 
   <table
     data-shared-blocks-key='{{shared_blocks_key}}'
@@ -79,12 +95,12 @@
       </td>
       <td>
        {{#screen_name}} {{! If full user object is available use it. }}
-       <a class='screen-name' href='https://mobile.twitter.com/{{screen_name}}'>
+       <a class='screen-name' href='https://twitter.com/{{screen_name}}'>
          {{screen_name}}
        </a>
        {{/screen_name}}
        {{^screen_name}} {{! Otherwise just do user id }}
-       <a href='https://mobile.twitter.com/intent/user?user_id={{uid}}'>
+       <a href='https://twitter.com/intent/user?user_id={{uid}}'>
           {{uid}}
        </a>
        {{/screen_name}}

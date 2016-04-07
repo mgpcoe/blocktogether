@@ -2,10 +2,13 @@
 (function() {
 var fs = require('fs'),
     path = require('path'),
+    tls = require('tls'),
+    https = require('https'),
+    Q = require('q'),
     twitterAPI = require('node-twitter-api'),
     log4js = require('log4js'),
     https = require('https'),
-    _ = require('sequelize').Utils._;
+    _ = require('lodash');
 
 /*
  * Config file should look like this:
@@ -27,39 +30,25 @@ var twitter = new twitterAPI({
 });
 
 log4js.configure(configDir + nodeEnv + '/log4js.json', {
-  cwd: '/usr/local/blocktogether/shared/log'
+  cwd: '/data/blocktogether/shared/log'
 });
 // The logging category is based on the name of the running script, e.g.
 // blocktogether, action, stream, etc.
-var scriptName = path.basename(require.main.filename).replace(".js", "");
+var scriptName = path.basename(require.main ? require.main.filename : 'repl')
+  .replace(".js", "");
 var logger = log4js.getLogger(scriptName);
-
-// Once a second log how many pending HTTPS requests there are.
-function logPendingRequests() {
-  var requests = https.globalAgent.requests;
-  if (Object.keys(requests).length === 0) {
-    logger.trace('Pending requests: 0');
-  } else {
-    for (var host in requests) {
-      logger.trace('Pending requests to', host, ':', requests[host].length);
-    }
-  }
-  var sockets = https.globalAgent.sockets;
-  if (Object.keys(sockets).length === 0) {
-    logger.trace('Open sockets: 0');
-  } else {
-    for (host in sockets) {
-      logger.trace('Open sockets to', host, ':', sockets[host].length);
-    }
-  }
-}
-setInterval(logPendingRequests, 5000);
 
 var sequelizeConfigData = fs.readFileSync(
   configDir + 'sequelize.json', 'utf8');
 var c = JSON.parse(sequelizeConfigData)[nodeEnv];
 var Sequelize = require('sequelize'),
     sequelize = new Sequelize(c.database, c.username, c.password, _.extend(c, {
+      dialectOptions: _.extend(c.dialectOptions || {}, {
+        bigNumberStrings: true,
+        supportBigNumbers: true,
+        charset: "utf8mb4",
+        collate: "utf8mb4_unicode_ci"
+      }),
       logging: function(message) {
         logger.trace(message);
       }
@@ -72,7 +61,7 @@ sequelize
 
 // Use snake_case for model accessors because that's SQL style.
 var TwitterUser = sequelize.define('TwitterUser', {
-  uid: { type: Sequelize.STRING, primaryKey: true },
+  uid: { type: Sequelize.BIGINT.UNSIGNED, primaryKey: true },
   friends_count: Sequelize.INTEGER,
   followers_count: Sequelize.INTEGER,
   profile_image_url_https: Sequelize.STRING,
@@ -92,7 +81,7 @@ var TwitterUser = sequelize.define('TwitterUser', {
  * specific to Block Together, as opposed to their Twitter user profile.
  */
 var BtUser = sequelize.define('BtUser', {
-  uid: { type: Sequelize.STRING, primaryKey: true },
+  uid: { type: Sequelize.BIGINT.UNSIGNED, primaryKey: true },
   // Technically we should get the screen name from the linked TwitterUser, but
   // it's much more convenient to have it right on the BtUser object.
   screen_name: Sequelize.STRING,
@@ -121,7 +110,15 @@ var BtUser = sequelize.define('BtUser', {
   // Otherwise we delete the BtUser and related data.
   // Users with a non-null deactivatedAt will be skipped when updating blocks,
   // performing actions, and streaming.
-  deactivatedAt: Sequelize.DATE
+  deactivatedAt: Sequelize.DATE,
+  // True if this user has any pending actions.
+  pendingActions: { type: Sequelize.BOOLEAN, defaultValue: false },
+  // A user may be paused manually if they have a large number of pending
+  // actions or blocks, and work on their account is slowing down work on other
+  // accounts. We don't execute actions or update blocks for paused users.
+  paused: { type: Sequelize.BOOLEAN, defaultValue: false },
+  // The number of blocks this user had at last fetch.
+  blockCount: { type: Sequelize.INTEGER, defaultValue: 0 },
 }, {
   instanceMethods: {
     /**
@@ -131,59 +128,47 @@ var BtUser = sequelize.define('BtUser', {
     inspect: function() {
       return [this.screen_name, this.uid].join(" ");
     },
-
-    /**
-     * Ask Twitter to verify a user's credentials. If they not valid,
-     * store the current time in user's deactivatedAt. If they are valid, clear
-     * the user's deactivatedAt. Save the user to DB if it's changed.
-     */
-    verifyCredentials: function() {
-      var user = this;
-      twitter.account('verify_credentials', {}, user.access_token,
-        user.access_token_secret, function(err, results) {
-          if (err && err.data) {
-            // For some reason the error data is given as a string, so we have to
-            // parse it.
-            var errJson = JSON.parse(err.data);
-            if (errJson.errors &&
-                errJson.errors.some(function(e) { return e.code === 89 })) {
-              logger.warn('User', user, 'revoked app.');
-              user.deactivatedAt = new Date();
-            } else if (err.statusCode === 404) {
-              logger.warn('User', user, 'deactivated or suspended.')
-              user.deactivatedAt = new Date();
-            } else {
-              logger.warn('Unknown error', err.statusCode, 'for', user, err.data);
-            }
-          } else {
-            logger.warn('User', user, 'has not revoked app.');
-            user.deactivatedAt = null;
-          }
-          if (user.changed()) {
-            user.save().error(function(err) {
-              logger.error(err);
-            });
-          }
-      });
-    }
   }
 });
 BtUser.hasOne(TwitterUser, {foreignKey: 'uid'});
 
+var Subscription = sequelize.define('Subscription', {
+  author_uid: Sequelize.BIGINT.UNSIGNED,
+  subscriber_uid: Sequelize.BIGINT.UNSIGNED
+});
+BtUser.hasMany(Subscription, {foreignKey: 'author_uid', as: 'Subscribers'});
+BtUser.hasMany(Subscription, {foreignKey: 'subscriber_uid', as: 'Subscriptions'});
+Subscription.belongsTo(BtUser, {foreignKey: 'author_uid', as: 'Author'});
+Subscription.belongsTo(BtUser, {foreignKey: 'subscriber_uid', as: 'Subscriber'});
+
+/**
+ * SharedBlocks differ from Blocks because they represent a long-term curated
+ * set of blocks, and are meant to be explicitly shared. Blocks and BlockBatches
+ * are a simple representation of the current state of a user's blocks based on
+ * what the Twitter API returns.
+ */
+var SharedBlock = sequelize.define('SharedBlock', {
+  author_uid: Sequelize.STRING,
+  sink_uid: Sequelize.STRING
+});
+SharedBlock.belongsTo(BtUser, {foreignKey: 'author_uid'});
+SharedBlock.belongsTo(TwitterUser, {foreignKey: 'sink_uid'});
+
 var Block = sequelize.define('Block', {
-  sink_uid: Sequelize.STRING,
-  type: Sequelize.STRING
+  sink_uid: Sequelize.BIGINT.UNSIGNED
 }, {
   timestamps: false
 });
+Block.removeAttribute('id');
 
 /**
  * Represents a batch of blocks fetched from Twitter, using cursoring.
  */
 var BlockBatch = sequelize.define('BlockBatch', {
-  source_uid: Sequelize.STRING,
+  source_uid: Sequelize.BIGINT.UNSIGNED,
   currentCursor: Sequelize.STRING,
-  complete: Sequelize.BOOLEAN
+  complete: Sequelize.BOOLEAN,
+  size: Sequelize.INTEGER
 });
 BlockBatch.hasMany(Block, {onDelete: 'cascade'});
 Block.belongsTo(TwitterUser, {foreignKey: 'sink_uid'});
@@ -199,60 +184,95 @@ BtUser.hasMany(BlockBatch, {foreignKey: 'source_uid', onDelete: 'cascade'});
  * and are inserted with status = 'done' as soon as we observe them.
  */
 var Action = sequelize.define('Action', {
-  source_uid: Sequelize.STRING,
-  sink_uid: Sequelize.STRING,
-  type: Sequelize.STRING, // block or unblock
-  status: { type: Sequelize.STRING, defaultValue: 'pending' },
+  source_uid: Sequelize.BIGINT.UNSIGNED,
+  sink_uid: Sequelize.BIGINT.UNSIGNED,
+  type: { type: 'TINYINT', field: 'typeNum' }, // Block, unblock, or mute
+  status: { type: 'TINYINT', field: 'statusNum' },
   // A cause indicates why the action occurred, e.g. 'bulk-manual-block',
   // or 'new-account'. When the cause is another Block Together user,
   // e.g. in the bulk-manual-block case, the uid of that user is recorded in
   // cause_uid. When cause is 'new-account' or 'low-followers'
   // the cause_uid is empty.
-  cause: Sequelize.STRING,
-  cause_uid: Sequelize.STRING
+  cause: { type: 'TINYINT', field: 'causeNum' },
+  cause_uid: Sequelize.BIGINT.UNSIGNED
+}, {
+  instanceMethods: {
+    status_str: function() {
+      return Action.statusNames[this.status];
+    },
+    cause_str: function() {
+      return Action.causeNames[this.cause];
+    },
+    type_str: function() {
+      return Action.typeNames[this.type];
+    }
+  }
 });
 // From a BtUser we want to get a list of Actions.
 BtUser.hasMany(Action, {foreignKey: 'source_uid'});
 // And from an Action we want to get a TwitterUser (to show screen name).
 Action.belongsTo(TwitterUser, {foreignKey: 'sink_uid'});
+// And also the screen name of the user who caused the action if it was from a
+// subscription.
+Action.belongsTo(BtUser, {foreignKey: 'cause_uid', as: 'CauseUser'});
 
-_.extend(Action, {
-  // Constants for the valid values of `status'.
-  PENDING: 'pending',
-  DONE: 'done',
-  CANCELLED_FOLLOWING: 'cancelled-following',
-  CANCELLED_SUSPENDED: 'cancelled-suspended',
-  // If the action did not need to be performed because the source was already
-  // blocking the sink.
-  CANCELLED_DUPLICATE: 'cancelled-duplicate',
-  // If a user has previously unblocked the target, the target should be immune
-  // from future automated blocks.
-  CANCELLED_UNBLOCKED: 'cancelled-unblocked',
-  // You cannot block yourself.
-  CANCELLED_SELF: 'cancelled-self',
-  // When we find a suspended user, we put it in a deferred state to be tried
-  // later.
-  DEFERRED_TARGET_SUSPENDED: 'deferred-target-suspended',
-  // When a user with pending actions is deactivated/suspended/revokes,
-  // cancel those pending actions.
-  CANCELLED_SOURCE_DEACTIVATED: 'cancelled-source-deactivated',
+Action.statusConstants = [
+  undefined,
+  "PENDING",
+  "DONE",
+  "CANCELLED_FOLLOWING",
+  "CANCELLED_SUSPENDED",
+  "CANCELLED_DUPLICATE",
+  "CANCELLED_UNBLOCKED",
+  "CANCELLED_SELF",
+  "DEFERRED_TARGET_SUSPENDED",
+  "CANCELLED_SOURCE_DEACTIVATED",
+  "CANCELLED_UNSUBSCRIBED"
+];
 
-  // Constants for the valid values of 'type'.
-  BLOCK: 'block',
-  UNBLOCK: 'unblock',
+Action.statusNames = [];
+for (var i = 0; i < Action.statusConstants.length; i++) {
+  if (i == 0) continue;
+  var name = Action.statusConstants[i];
+  Action[name] = i;
+  Action.statusNames[i] = name.toLowerCase().replace(/_/g, "-");
+}
 
-  // Constants for the valid values of 'cause'
-  BULK_MANUAL_BLOCK: 'bulk-manual-block', // 'Block all' from a shared list.
-  NEW_ACCOUNT: 'new-account', // "Block new accounts" blocked this user.
-  LOW_FOLLOWERS: 'low-followers', // "Block unpopular accounts" block this user.
-  EXTERNAL: 'external' // Done byTwitter web or other app, and observed by BT.
-});
+Action.causeConstants = [
+  undefined,
+  "EXTERNAL",
+  "SUBSCRIPTION",
+  "NEW_ACCOUNT",
+  "LOW_FOLLOWERS",
+  "BULK_MANUAL_BLOCK"
+];
+Action.causeNames = [];
+for (var i = 0; i < Action.causeConstants.length; i++) {
+  if (i == 0) continue;
+  var name = Action.causeConstants[i];
+  Action[name] = i;
+  Action.causeNames[i] = name.toLowerCase().replace(/_/g, "-");
+}
+Action.cause_str = function() {
+  return Action.causeNames[this.cause];
+}
 
-sequelize
-  .sync()
-    .error(function(err) {
-       logger.error(err);
-    });
+Action.typeConstants = [
+  undefined,
+  "BLOCK",
+  "UNBLOCK",
+  "MUTE",
+];
+Action.typeNames = [];
+for (var i = 0; i < Action.typeConstants.length; i++) {
+  if (i == 0) continue;
+  var name = Action.typeConstants[i];
+  Action[name] = i;
+  Action.typeNames[i] = name.toLowerCase().replace(/_/g, "-");
+}
+Action.type_str = function() {
+  return Action.typeNames[this.type];
+}
 
 // User to follow from settings page. In prod this is @blocktogether.
 // Initially blank, and loaded asynchronously. It's unlikely the
@@ -262,22 +282,78 @@ BtUser.find({
   where: {
     screen_name: config.userToFollow
   }
-}).error(function(err) {
-  logger.error(err);
-}).success(function(user) {
+}).then(function(user) {
   _.assign(userToFollow, user);
+}).catch(function(err) {
+  logger.error(err);
+});
+
+var keepAliveAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000 * 1000
+});
+
+/**
+ * Make a request to update-blocks to update blocks for a user.
+ * @param {BtUser} user
+ * @returns {Promise.<null>} A promise that resolves once blocks are updated.
+ */
+function remoteUpdateBlocks(user) {
+  var deferred = Q.defer();
+  logger.debug('Requesting block update for', user);
+  var opts = {
+    method: 'POST',
+    agent: keepAliveAgent,
+    host: config.updateBlocks.host,
+    port: config.updateBlocks.port,
+    // Provide a client certificate so the server knows it's us.
+    cert: fs.readFileSync(configDir + 'rpc.crt'),
+    key: fs.readFileSync(configDir + 'rpc.key'),
+    // For validating the self-signed server cert
+    ca: fs.readFileSync(configDir + 'rpc.crt'),
+    rejectUnauthorized: false
+  };
+  var req = https.request(opts, function(res) {
+    deferred.resolve();
+  });
+  req.on('error', function(err) {
+    // Ignore ECONNRESET: The server will occasionally close the socket, which
+    // is fine.
+    if (err.code != 'ECONNRESET') {
+      logger.error(err);
+      deferred.reject(err);
+    }
+  });
+  req.end(JSON.stringify({
+    uid: user.uid,
+    callerName: scriptName
+  }));
+  return deferred.promise;
+}
+
+function gracefulShutdown() {
+}
+
+process.on('uncaughtException', function(err) {
+  logger.fatal('uncaught exception, shutting down: ', err);
+  process.exit(133);
 });
 
 module.exports = {
-  config: config,
-  twitter: twitter,
-  sequelize: sequelize,
-  logger: logger,
-  userToFollow: userToFollow,
-  TwitterUser: TwitterUser,
-  BtUser: BtUser,
+  Action: Action,
   Block: Block,
   BlockBatch: BlockBatch,
-  Action: Action
+  BtUser: BtUser,
+  TwitterUser: TwitterUser,
+  Subscription: Subscription,
+  SharedBlock: SharedBlock,
+  config: config,
+  configDir: configDir,
+  logger: logger,
+  sequelize: sequelize,
+  twitter: twitter,
+  userToFollow: userToFollow,
+  remoteUpdateBlocks: remoteUpdateBlocks,
+  gracefulShutdown: gracefulShutdown
 };
 })();

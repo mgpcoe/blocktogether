@@ -4,10 +4,43 @@ An API app intended to help cope with harassers and abusers on Twitter.
 
 See more details at https://blocktogether.org.
 
-# Setup instructions
+# Developer Setup Instructions
 
-Run ./setup.sh (uses apt-get; modify if you are on a non-Debian/Ubuntu distro).
-Then run ./run.sh and visit http://localhost:3000.
+First, create an app on Twitter for your local version of blocktogether:
+
+  1. Head to https://apps.twitter.com/ and click "Create New App."
+
+  2. Fill out form & click "Create your Twitter application".
+     Important: fill in some arbitrary URL for 'Callback URL.' It will be overridden
+     by the app, but if it's empty you won't be able to log in.
+     The description and website don't matter; You'll only be using this for testing.
+
+  3. Under "Application Settings" > "Access level", click "modify app permissions"
+     and select "Read and Write" access. The write permission is necessary to apply
+     blocks, unblocks, and mutes. You may need to add a phone number to your
+     account in order to get read/write permission.
+
+  4. After you've set the read-write permissions, click the "Keys and Access Tokens"
+     tab. Note that changing your app's permissions will regenerate these keys.
+
+  5. Copy config/development.json to ~/.btconfig.json, and edit the
+     "consumerKey" and "consumerSecret" fields to match the "Consumer Key (API
+     Key)" and "Consumer Secret (API Secret)" fields from the "Keys and Access
+     Tokens" page.
+
+Next, make sure that you have [Vagrant](https://www.vagrantup.com/) installed.
+From the blocktogether directory, run:
+
+    vagrant up
+    vagrant ssh -c /vagrant/run-dev.sh
+
+You can now access your local version of Block Together in a browser
+at http://localhost:3000.
+
+**Note:** It's highly recommended you create a few test accounts
+on Twitter in order to be able to exercise the sharing functionality of Block
+Together, and so that you don't create or delete blocks on your main account
+unintentionally.
 
 # License
 

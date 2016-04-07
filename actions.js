@@ -2,12 +2,16 @@
 (function() {
 
 /**
- * Script to block a list of screen names using credentials for a given user id
+ * Queueing and processing of actions (block, unblock, mute, etc).
  */
 var twitterAPI = require('node-twitter-api'),
+    https = require('https'),
     fs = require('fs'),
-    _ = require('sequelize').Utils._,
-    setup = require('./setup');
+    Q = require('q'),
+    _ = require('lodash'),
+    util = require('./util'),
+    setup = require('./setup'),
+    verifyCredentials = require('./verify-credentials');
 
 var twitter = setup.twitter,
     logger = setup.logger,
@@ -26,13 +30,13 @@ var twitter = setup.twitter,
  *
  * @param {string} source_uid The user who wants to perform these actions.
  * @param {Array.<string>} list A list of uids to target with the actions.
- * @param {string} type The type of action, e.g block/unblock.
- * @param {string} cause The cause to be recorded on the Actions.
+ * @param {Number} type The type of action, e.g block/unblock.
+ * @param {Number} cause The cause to be recorded on the Actions.
  * @param {string} cause_uid Uid of the user who caused the actions, e.g.
  *    the author of a shared block list if cause is 'bulk-manual-block.'
  */
 function queueActions(source_uid, list, type, cause, cause_uid) {
-  Action.bulkCreate(
+  return Action.bulkCreate(
     list.map(function(sink_uid) {
       return {
         source_uid: source_uid,
@@ -42,18 +46,11 @@ function queueActions(source_uid, list, type, cause, cause_uid) {
         cause_uid: cause_uid,
         'status': Action.PENDING
       }
-    })).error(function(err) {
-      logger.error(err);
-    }).success(function(actions) {
-      // After writing the actions to the DB, wait 1s and process all actions
-      // for the user. Waiting a bit allows more actions to accumulate so they
-      // can be batched better, e.g. during stream startup. Note that we still
-      // wind up with a queue of processing requests right on top of each other,
-      // which is not ideal. TODO: Keep track in memory of which users have had
-      // a very recent processing run, and don't add additional ones.
-      setTimeout(function() {
-        processActionsForUserId(source_uid);
-      }, 1000);
+    })).then(function() {
+      return BtUser.findById(source_uid);
+    }).then(function(user) {
+      user.pendingActions = true;
+      return user.save();
     });
 }
 
@@ -78,72 +75,105 @@ function queueActions(source_uid, list, type, cause, cause_uid) {
  * at a time, but it does not appear to have a rate limit.
  */
 function processActions() {
-  Action.findAll({
-    where: ['status = "pending"'],
-    group: 'source_uid',
+  return BtUser.findAll({
+    where: {
+      pendingActions: true,
+      paused: false
+    },
     limit: 300
-  }).error(function(err) {
+  }).then(function(users) {
+    if (users && users.length > 0) {
+      logger.info('Processing actions for', users.length, 'users');
+      // Space out the kickoff of each user's processing batch to get better
+      // reuse of HTTPS connections to Twitter. TODO: Measure latency of Twitter
+      // requests.
+      return util.slowForEach(users, 100 /* ms */, processActionsForUser);
+    } else {
+      // No pending actions for anyone, wow!
+      return Q.resolve(null);
+    }
+  }).catch(function(err) {
     logger.error(err);
-  }).success(function(actions) {
-    actions.forEach(function(action) {
-      processActionsForUserId(action.source_uid);
-    });
-  })
+  });
 }
 
-/**
- * For a given user id, fetch and process pending actions.
- * @param {string} uid The uid of the user to process.
- */
-function processActionsForUserId(uid) {
-  BtUser.find(uid)
-    .error(function(err) {
-      logger.error(err);
-    }).success(function(btUser) {
-      if (!btUser || btUser.deactivatedAt) {
-        // Cancel all pending actions for deactivated or absent users.
-        logger.error('User missing or deactivated', uid);
-        cancelSourceDeactivated(uid);
-      } else {
-        getActions(btUser, 'block', processBlocksForUser);
-        getActions(btUser, 'unblock', processUnblocksForUser);
-        getActions(btUser, 'mute', processMutesForUser);
-      }
-    });
-}
+var workingActions = {};
 
 /**
- * Find all actions of a given type for btUser, and call callback with
- * btUser and actions. If there is an error or there are no actions, callback
- * will not be called.
- *
- * @param {BtUser} btUser The user whose actions we're going to process.
- * @param {string} type The type of actions to look for.
- * @param {Function} callback A function taking (BtUser, Action[]). Called only
- *   on success.
+ * For a given user, fetch and process pending actions.
+ * Actions are processed in batches of up to 100, but they must all be the same
+ * type, and must be in order by createdAt. So we pick up to 100 actions that
+ * match the type of the earliest available pending action for the uid.
+ * @param {BtUser} user The user to process.
  */
-function getActions(btUser, type, callback) {
-  // We use a nested fetch here rather than an include because the actions
+function processActionsForUser(user) {
+  var uid = user.uid;
+  if (workingActions[uid]) {
+    logger.warn('Skipping processing for', uid,
+      'actions already in progress.', workingActions[uid]);
+    return Q.resolve(null);
+  }
+  if (!user || user.deactivatedAt) {
+    // Cancel all pending actions for deactivated or absent users.
+    logger.info('User missing or deactivated', uid);
+    return cancelSourceDeactivated(user).then(function() {
+      return Q.resolve(null);
+    });
+  }
+  // We use a separate fetch here rather than an include because the actions
   // for a user can be quite large. The SQL generated by a BtUser.find
   // with an include statement has two problems: (1) It doesn't respect
   // the limit clause, and (2) each row returned for Actions also includes
   // the full BtUser object, which contains some long strings. This is
   // very wasteful.
-  btUser.getActions({
-    // Out of the available pending block actions on this user,
-    // pick up to 100 with the earliest updatedAt times.
+  return Action.findAll({
+    // Out of the available pending actions on this user,
+    // pick up to 100 with the earliest createdAt times.
     where: {
-      status: 'pending',
-      type: type
+      status: Action.PENDING,
+      source_uid: uid
     },
-    order: 'updatedAt ASC',
+    order: 'createdAt ASC',
     limit: 100
-  }).error(function(err) {
-    logger.error(err);
-  }).success(function(actions) {
-    if (actions && actions.length > 0) {
-      callback(btUser, actions);
+  }).then(function(actions) {
+    if (actions.length === 0) {
+      user.pendingActions = false;
+      return user.save().then(function() {
+        Q.resolve(null);
+      });
+    } else {
+      // Order across action types can be important, for instance when there are
+      // both a block and an unblock action enqueued. We get 100 actions, then
+      // slice out the first run of actions that all have the same type, and
+      // run those actions.
+      var firstActionType = actions[0].type;
+      var firstDiffIndex = _.findIndex(actions, function(action) {
+        return action.type !== firstActionType;
+      });
+      logger.debug("firstDiffIndex", firstDiffIndex);
+      var run = actions;
+      if (firstDiffIndex !== -1) {
+        logger.debug('Skipping some actions in this run because they are not',
+          firstActionType);
+        run = actions.slice(0, firstDiffIndex);
+      }
+      workingActions[uid] = 1;
+      var processingPromise = null;
+      if (firstActionType === Action.BLOCK) {
+        processingPromise = processBlocksForUser(user, run);
+      } else if (firstActionType === Action.UNBLOCK) {
+        processingPromise = processUnblocksForUser(user, run);
+      } else if (firstActionType === Action.MUTE) {
+        processingPromise = processMutesForUser(user, run);
+      }
+      workingActions[uid] = processingPromise;
+      return processingPromise;
     }
+  }).catch(function(err) {
+    logger.error(err);
+  }).finally(function() {
+    delete workingActions[uid];
+    return Q.resolve(null);
   });
 }
 
@@ -151,41 +181,88 @@ function getActions(btUser, type, callback) {
  * For a uid that has been determined to be deactivated, mark all of that
  * user's pending actions with status = CANCELLED_SOURCE_DEACTIVATED.
  *
- * @param {string} uid User id for whom to modify actions.
+ * @param {BtUser} user User for whom to modify actions.
  */
-function cancelSourceDeactivated(uid) {
-  Action.update({
+function cancelSourceDeactivated(user) {
+  return Action.update({
     status: Action.CANCELLED_SOURCE_DEACTIVATED
-  }, { /* where */
-    source_uid: uid,
-    status: Action.PENDING
-  }).error(function(err) {
+  }, {
+    where: {
+      source_uid: user.uid,
+      status: Action.PENDING
+    }
+  }).then(function() {
+    user.pendingActions = 0;
+    return user.save();
+  }).catch(function(err) {
     logger.error(err);
   })
 }
 
-function block(sourceBtUser, sinkUid, callback) {
-  twitter.blocks('create', {
-      user_id: sinkUid,
-      skip_status: 1
-    }, sourceBtUser.access_token, sourceBtUser.access_token_secret,
-    callback);
+/**
+ * Cancel any pending actions caused by subscriber's subscription to author's
+ * block list.
+ * @param {string} subscriber_uid
+ * @param {string} author_uid
+ */
+function cancelUnsubscribed(subscriber_uid, author_uid) {
+  return Action.update({
+    status: Action.CANCELLED_UNSUBSCRIBED
+  }, {
+    where: {
+      source_uid: subscriber_uid,
+      cause_uid: author_uid,
+      cause: Action.SUBSCRIPTION,
+      status: Action.PENDING
+    }
+  })
 }
 
-function unBlock(sourceBtUser, sinkUid, callback) {
-  twitter.blocks('destroy', {
+function doBlock(sourceBtUser, sinkUid) {
+  return Q.ninvoke(twitter, 'blocks', 'create', {
       user_id: sinkUid,
       skip_status: 1
-    }, sourceBtUser.access_token, sourceBtUser.access_token_secret,
-    callback);
+    }, sourceBtUser.access_token, sourceBtUser.access_token_secret)
+    .spread(function(result, response) {
+      logger.trace('/blocks/create', sourceBtUser, sinkUid,
+        response.statusCode);
+      return result;
+    });
 }
 
-function mute(sourceBtUser, sinkUid, callback) {
-  twitter.mutes('users/create', {
+function doUnblock(sourceBtUser, sinkUid) {
+  return Q.ninvoke(twitter, 'blocks', 'destroy', {
       user_id: sinkUid,
       skip_status: 1
-    }, sourceBtUser.access_token, sourceBtUser.access_token_secret,
-    callback);
+    }, sourceBtUser.access_token, sourceBtUser.access_token_secret)
+    .spread(function(result, response) {
+      logger.trace('/blocks/destroy', sourceBtUser, sinkUid,
+        response.statusCode);
+      return result;
+    });
+}
+
+function doMute(sourceBtUser, sinkUid) {
+  return Q.ninvoke(twitter, 'mutes', 'users/create', {
+      user_id: sinkUid,
+      skip_status: 1
+    }, sourceBtUser.access_token, sourceBtUser.access_token_secret)
+    .spread(function(result, response) {
+      logger.trace('/mutes/users/create', sourceBtUser, sinkUid,
+        response.statusCode);
+      return result;
+    });
+}
+
+function getFriendships(btUser, sinkUids) {
+  return Q.ninvoke(twitter, 'friendships', 'lookup', {
+      user_id: sinkUids.join(',')
+    }, btUser.access_token, btUser.access_token_secret)
+    .spread(function(result, response) {
+      logger.trace('/friendships/lookup', btUser, sinkUids,
+        response.statusCode);
+      return result;
+    });
 }
 
 function processUnblocksForUser(btUser, actions) {
@@ -199,47 +276,65 @@ function processUnblocksForUser(btUser, actions) {
   // The https library should simply queue the requests until there is an
   // available socket for them. We may want to simplify the blocks code to do
   // the same.
-  actions.forEach(function(action) {
-    if (action.type != 'unblock') {
-      logger.error("Shouldn't happen: non-unblock action", btUser);
+  return Q.all(actions.map(function(action) {
+    if (action.type !== Action.UNBLOCK) {
+      return Q.reject("Shouldn't happen: non-unblock action " + btUser.inspect() +
+        " " + JSON.stringify(action.dataValues));
     }
-    unBlock(btUser, action.sink_uid, function(err, results) {
+    return doUnblock(btUser, action.sink_uid).then(function() {
+      logger.info('Unblocked', btUser, '-->', action.sink_uid);
+      return setActionStatus(action, Action.DONE);
+    }).catch(function (err) {
       // TODO: This error handling is repeated for all actions. Abstract into
       // its own function.
-      if (err && err.statusCode === 404) {
+      if (err && (err.statusCode === 401 || err.statusCode === 403)) {
+        verifyCredentials(btUser);
+        return Q.resolve(null);
+      } else if (err && err.statusCode === 404) {
         logger.info('Unblock returned 404 for inactive sink_uid',
           action.sink_uid, 'cancelling action.');
-        setActionStatus(action, Action.DEFERRED_TARGET_SUSPENDED);
-      } else if (err) {
-        logger.error('Error /blocks/destroy', err.statusCode, btUser,
+        return setActionStatus(action, Action.DEFERRED_TARGET_SUSPENDED);
+      } else if (err.statusCode) {
+        logger.warn('Error /blocks/destroy', err.statusCode, btUser,
           '-->', action.sink_uid);
+        // Don't change the state of the action: It will be retried later.
+        return Q.resolve(null);
       } else {
-        logger.info('Unblocked', btUser, '-->', action.sink_uid);
-        setActionStatus(action, Action.DONE);
+        logger.error('Error /blocks/destroy', err);
+        return Q.resolve(null);
       }
     });
-  });
+  }));
 }
 
 function processMutesForUser(btUser, actions) {
-  actions.forEach(function(action) {
-    if (action.type != 'mute') {
-      logger.error("Shouldn't happen: non-mute action", btUser);
+  return Q.all(actions.map(function(action) {
+    if (action.type !== Action.MUTE) {
+      return Q.reject("Shouldn't happen: non-mute action " + btUser.inspect() +
+        " " + JSON.stringify(action.dataValues));
     }
-    mute(btUser, action.sink_uid, function(err, results) {
-      if (err && err.statusCode === 404) {
+    return doMute(btUser, action.sink_uid).then(function() {
+      logger.info('Muted', btUser, '-->', action.sink_uid);
+      return setActionStatus(action, Action.DONE);
+    }).catch(function(err) {
+      if (err && (err.statusCode === 401 || err.statusCode === 403)) {
+        verifyCredentials(btUser);
+        return Q.resolve(null);
+      } else if (err && err.statusCode === 404) {
         logger.info('Unmute returned 404 for inactive sink_uid',
           action.sink_uid, 'cancelling action.');
-        setActionStatus(action, Action.DEFERRED_TARGET_SUSPENDED);
-      } else if (err) {
-        logger.error('Error /mutes/users/create', err.statusCode, btUser,
+        return setActionStatus(action, Action.DEFERRED_TARGET_SUSPENDED);
+      } else if (err.statusCode) {
+        logger.warn('Error /mutes/users/create', err.statusCode, btUser,
           '-->', action.sink_uid);
+        return Q.resolve(null);
       } else {
-        logger.info('Muted', btUser, '-->', action.sink_uid);
-        setActionStatus(action, Action.DONE);
+        logger.error('Error /mutes/users/create', err);
+        return Q.resolve(null);
       }
+      return Q.resolve(null);
     });
-  });
+  }));
 }
 
 /**
@@ -253,25 +348,28 @@ function processMutesForUser(btUser, actions) {
  * @param {Array.<Action>} actions Actions to process.
  */
 function processBlocksForUser(btUser, actions) {
-  var sinkUids = _.pluck(actions, 'sink_uid');
+  var sinkUids = _.map(actions, 'sink_uid');
   if (sinkUids.length > 100) {
     logger.error('No more than 100 sinkUids allowed. Given', sinkUids.length);
-    return;
+    return Q.reject('Too many sinkUids');
   }
   logger.debug('Checking follow status', btUser,
     '--???-->', sinkUids.length, 'users');
-  twitter.friendships('lookup', {
-      user_id: sinkUids.join(',')
-    }, btUser.access_token, btUser.access_token_secret,
-    function(err, friendships) {
-      if (err && err.statusCode === 401) {
-        btUser.verifyCredentials();
-      } else if (err) {
-        logger.error('Error /friendships/lookup', err.statusCode, 'for',
-          btUser.screen_name, err.data);
+  return getFriendships(btUser, sinkUids
+    ).then(function(friendships) {
+      var indexedFriendships = _.indexBy(friendships, 'id_str');
+      return checkUnblocks(btUser, indexedFriendships, actions);
+    }).catch(function (err) {
+      if (err.statusCode === 401 || err.statusCode === 403) {
+        verifyCredentials(btUser)
+        return Q.resolve(null);
+      } else if (err.statusCode) {
+        logger.warn('Error /friendships/lookup', err.statusCode, 'for',
+          btUser);
+        return Q.resolve(null);
       } else {
-        var indexedFriendships = _.indexBy(friendships, 'id_str');
-        checkUnblocks(btUser, indexedFriendships, actions);
+        logger.error('Error /friendships/lookup', err);
+        return Q.resolve(null);
       }
     });
 }
@@ -293,10 +391,10 @@ function processBlocksForUser(btUser, actions) {
  *   cancelled.
  */
 function checkUnblocks(sourceBtUser, indexedFriendships, actions) {
-  var sinkUids = _.pluck(actions, 'sink_uid');
+  var sinkUids = _.map(actions, 'sink_uid');
   // Look for the any previous unblock Action for this sink_uid with
   // status = done, cause = external, and cancel if it exists.
-  Action.findAll({
+  return Action.findAll({
     where: {
       source_uid: sourceBtUser.uid,
       sink_uid: sinkUids,
@@ -304,46 +402,34 @@ function checkUnblocks(sourceBtUser, indexedFriendships, actions) {
       cause: [Action.EXTERNAL, Action.BULK_MANUAL_BLOCK],
       type: Action.UNBLOCK
     }
-  }).error(function(err) {
-    logger.error(err);
-  }).success(function(unblocks) {
+  }).then(function(unblocks) {
     var indexedUnblocks = _.indexBy(unblocks, 'sink_uid');
-    cancelOrPerformBlocks(
-      sourceBtUser, indexedFriendships, indexedUnblocks, actions);
+    return util.slowForEach(actions, 70, function(action) {
+      return cancelOrPerformBlock(
+        sourceBtUser, indexedFriendships, indexedUnblocks, action);
+    });
+  }).catch(function(err) {
+    logger.error(err);
+    return Q.resolve(null);
   });
 }
 
 /**
- * After fetching friendships results from the Twitter API, process each one,
- * one at a time, and block if appropriate. This function calls itself
- * recursively in the callback from the Twitter API, to avoid queuing up large
- * numbers of HTTP requests abruptly. NOTE: This async recursion is a little
- * confusing and may not be necessary. The original incident that prompted
- * adding it was that when processing large batches, Block Together would get
- * connection hangup from Twitter. However, several other bug fixes went in
- * around the same time, and any one of them may have been the "real" fix.
+ * After fetching friendships results from the Twitter API, process action
+ * and block if appropriate. Otherwise cancel.
  *
  * @param{BtUser} sourceBtUser The user doing the blocking.
  * @param{Object} indexedFriendships A map from sink uids to friendship objects
  *   as returned by the Twitter API.
  * @param{Object} indexedUnblocks A map from sink uids to previous unblock
  *   action, if present.
- * @param{Array.<Action>} actions The list of actions to be performed or
- *   cancelled.
+ * @param{Array.<Action>} action An action to be performed or cancelled.
+ * @return{Promise.<Action>}
  */
-function cancelOrPerformBlocks(
-    sourceBtUser, indexedFriendships, indexedUnblocks, actions) {
-  if (!actions || actions.length < 1) {
-    return;
-  }
-  var next = cancelOrPerformBlocks.bind(
-      undefined, sourceBtUser, indexedFriendships,
-      indexedUnblocks, actions.slice(1));
-  var action = actions[0];
+function cancelOrPerformBlock(sourceBtUser, indexedFriendships, indexedUnblocks, action) {
   // Sanity check that this is a block, not some other action.
-  if (action.type != 'block') {
-    logger.error("Shouldn't happen: non-block action", sourceBtUser);
-    next();
+  if (action.type != Action.BLOCK) {
+    return Q.reject("Shouldn't happen: non-block action " + sourceBtUser);
   }
   var sink_uid = action.sink_uid;
   var friendship = indexedFriendships[sink_uid];
@@ -370,59 +456,79 @@ function cancelOrPerformBlocks(
   }
   // If we're cancelling, update the state of the action.
   if (newState) {
-    setActionStatus(action, newState, next);
+    return setActionStatus(action, newState);
   } else {
     // No obstacles to blocking the sink_uid have been found, block 'em!
     logger.debug('Creating block', sourceBtUser.screen_name,
       '--block-->', friendship.screen_name, sink_uid);
-    block(sourceBtUser, sink_uid, function(err, results) {
-      if (err) {
-        logger.error('Error /blocks/create', err.statusCode,
-          sourceBtUser.screen_name, sourceBtUser.uid,
-          '--block-->', friendship.screen_name, friendship.id_str,
-          err.data);
-      } else {
+    return doBlock(sourceBtUser, sink_uid
+      ).then(function(blockResult) {
         logger.info('Blocked ', sourceBtUser.screen_name, sourceBtUser.uid,
-          '--block-->', results.screen_name, results.id_str);
-        setActionStatus(action, Action.DONE, next);
-      }
-    });
+          '--block-->', blockResult.screen_name, blockResult.id_str);
+        return setActionStatus(action, Action.DONE);
+      }).catch(function(err) {
+        if (err && (err.statusCode === 401 || err.statusCode === 403)) {
+          verifyCredentials(sourceBtUser);
+          return Q.resolve(null);
+        } else if (err.statusCode) {
+          logger.warn('Error /blocks/create', err.statusCode,
+            sourceBtUser.screen_name, sourceBtUser.uid,
+            '--block-->', friendship.screen_name, friendship.id_str);
+          return Q.resolve(null);
+        } else {
+          logger.error('Error /blocks/create', err);
+          return Q.resolve(null);
+        }
+      });
   }
 }
 
-function nothing() {
-}
-
 /**
- * Set an action's status to newState, save it, and call the `next' callback
- * regardless of success or error.
+ * Set an action's status to newState.
  * @param {Action} action Action to modify.
  * @param {string} newState The new state to assign to it.
- * @param {Function=} next A callback to call when done.
+ * @return {Promise.<Action>} A promise resolved on saving.
  */
-function setActionStatus(action, newState, next) {
-  next = next || nothing;
+function setActionStatus(action, newState) {
+  logger.debug('Action', action.id, action.source_uid, action.type,
+    action.sink_uid, 'changing to state', newState);
   action.status = newState;
-  action.save().error(function(err) {
-    logger.error(err);
-    next();
-  }).success(next);
+  return action.save();
 }
 
 module.exports = {
+  cancelUnsubscribed: cancelUnsubscribed,
   queueActions: queueActions,
-  processActionsForUserId: processActionsForUserId
+  processActionsForUser: processActionsForUser
 };
 
 if (require.main === module) {
-  // TODO: It's possible for one run of processActions could take more than 60
-  // seconds, in which case we wind up with multiple instances running
-  // concurrently. This probably won't happen since each run only processes 100
-  // items per user, but with a lot of users it could, and would lead to some
-  // redundant work as each instance tried to grab work from a previous
-  // instance. Figure out a way to prevent this while being robust (i.e. not
-  // having to make sure every possible code path calls a finishing callback).
+  // When many users are have processing, it takes about 180 seconds to get
+  // through all of the batches of 100 blocks. Space out intervals to avoid
+  // overlap. NOTE: with workingActions[] keeping track now, this should no
+  // longer be necessary.
   processActions();
-  setInterval(processActions, 60 * 1000);
+  setInterval(processActions, 180 * 1000);
+
+  // Once a second log how many pending HTTPS requests there are.
+  var logPendingRequests = function() {
+    var requests = twitter.keepAliveAgent.requests;
+    if (Object.keys(requests).length === 0) {
+      logger.trace('Pending requests: 0');
+    } else {
+      for (var host in requests) {
+        logger.trace('Pending requests to', host, ':', requests[host].length);
+      }
+    }
+    var sockets = twitter.keepAliveAgent.sockets;
+    if (Object.keys(sockets).length === 0) {
+      logger.trace('Open sockets: 0');
+    } else {
+      for (host in sockets) {
+        logger.trace('Open sockets to', host, ':', sockets[host].length);
+      }
+    }
+  }
+  setInterval(logPendingRequests, 5000);
 }
 })();

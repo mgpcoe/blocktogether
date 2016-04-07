@@ -1,11 +1,13 @@
 {
   "port": 3000,
+  "updateBlocks": {
+    "host": "localhost",
+    "port": 8100
+  },
   "callbackUrl": "http://localhost:3000/auth/twitter/callback",
   "secureProxy": false,
-  "consumerKey": "XXXXXXXXXXXXXXXXXXXXXXXXX",
-  "consumerSecret": "YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY",
-  "cookieSecret": "ZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-  "defaultAccessToken": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-  "defaultAccessTokenSecret": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-  "userToFollow": "test_account"
+  "cookieSecret": "f46140502de85b9056978961f6377e0eadcfee2a",
+  "userToFollow": "test_account",
+  "consumerKey": "__CONSUMER_KEY__",
+  "consumerSecret": "__CONSUMER_SECRET__"
 }

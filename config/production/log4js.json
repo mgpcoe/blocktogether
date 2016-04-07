@@ -89,6 +89,45 @@
       "filename": "update-blocks-warn.log",
       "layout": { "type": "colored" }
     }
+  }, {
+    "type": "logLevelFilter",
+    "level": "TRACE",
+    "category": "verify-credentials",
+    "appender": {
+      "type": "console"
+    }
+  }, {
+    "type": "logLevelFilter",
+    "level": "TRACE",
+    "category": "deleter",
+    "appender": {
+      "type": "console"
+    }
+  }, {
+    "type": "logLevelFilter",
+    "level": "TRACE",
+    "category": "deleter",
+    "appender": {
+      "type": "file",
+      "filename": "deleter-info.log",
+      "layout": { "type": "colored" }
+    }
+  }, {
+    "type": "logLevelFilter",
+    "level": "TRACE",
+    "category": "subscriptions",
+    "appender": {
+      "type": "console"
+    }
+  }, {
+    "type": "logLevelFilter",
+    "level": "TRACE",
+    "category": "console",
+    "appender": {
+      "type": "file",
+      "filename": "console.log",
+      "layout": { "type": "colored" }
+    }
   }],
   "replaceConsole": true
 }
